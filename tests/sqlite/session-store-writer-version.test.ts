@@ -300,7 +300,7 @@ describe('schema writer-version stamp', () => {
 
     expect(readSchemaWriterStamp(store.db)).toBe(LATEST_SCHEMA_VERSION);
     const ftsTables = store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%_fts'").all() as { name: string }[];
-    expect(ftsTables.map(row => row.name).sort()).toEqual(['observations_fts', 'session_summaries_fts']);
+    expect(ftsTables.map(row => row.name).sort()).toEqual(['observations_fts', 'session_summaries_fts', 'tool_uses_fts']);
     store.close();
   });
 

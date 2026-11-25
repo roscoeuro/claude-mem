@@ -7,6 +7,7 @@ import { FormattingService } from './FormattingService.js';
 import { TimelineService } from './TimelineService.js';
 import type { TimelineItem } from './TimelineService.js';
 import type { ObservationSearchResult, SessionSummarySearchResult, UserPromptSearchResult } from '../sqlite/types.js';
+import type { ToolUseSearchHit } from '../sqlite/SessionSearch.js';
 import { logger } from '../../utils/logger.js';
 import { getProjectContext } from '../../utils/project-name.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
@@ -623,6 +624,18 @@ export class SearchManager {
 
     const totalResults = observations.length + sessions.length + prompts.length;
 
+    // Deeper tier (#4060): raw tool input/output, queried only when observation-level search
+    // came up empty. Hits are pointers for get_tool_uses, not results in their own right, so
+    // they never count toward totalResults.
+    let toolUses: ToolUseSearchHit[] = [];
+    if (query && totalResults === 0 && searchObservations) {
+      try {
+        toolUses = this.sessionSearch.searchToolUses(query, { ...options, limit: 10 });
+      } catch (error) {
+        logger.warn('SEARCH', 'Raw tool I/O search failed', {}, error instanceof Error ? error : new Error(String(error)));
+      }
+    }
+
     // Telemetry envelope (search_performed): derive the strategy from the
     // three paths above. Enum/count values only — never the Chroma error
     // message, query text, or result content.
@@ -667,11 +680,19 @@ export class SearchManager {
         sessions,
         prompts,
         totalResults,
+        ...(toolUses.length > 0 ? { toolUses } : {}),
         query: query || ''
       };
     }
 
     if (totalResults === 0) {
+      if (toolUses.length > 0) {
+        const parts = chromaFailureReason !== null
+          ? [ResultFormatter.formatChromaFailureMessage(chromaFailureReason), '']
+          : [];
+        parts.push(ResultFormatter.formatToolUseHits(query, toolUses));
+        return { content: [{ type: 'text' as const, text: parts.join('\n') }] };
+      }
       if (chromaFailureReason !== null) {
         return {
           content: [{
