@@ -92,6 +92,46 @@ export const SESSION_SUMMARIES_FTS_TRIGGERS_SQL = `
   END;
 `;
 
+export const TOOL_USES_FTS_TRIGGER_NAMES = ['tool_uses_ai', 'tool_uses_ad', 'tool_uses_au'];
+
+/**
+ * Sync triggers for the raw tool I/O index (#4060). Same external-content shape as the
+ * observation index. The upsert in tool-uses.ts refreshes a replayed row through ON CONFLICT
+ * DO UPDATE, which fires the update trigger; it is scoped to the indexed columns so the late
+ * observation link (observation_id, memory_session_id) never rewrites the index.
+ */
+export const TOOL_USES_FTS_TRIGGERS_SQL = `
+  CREATE TRIGGER IF NOT EXISTS tool_uses_ai AFTER INSERT ON tool_uses BEGIN
+    INSERT INTO tool_uses_fts(rowid, tool_name, tool_input, tool_response)
+    VALUES (new.id, new.tool_name, new.tool_input, new.tool_response);
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS tool_uses_ad AFTER DELETE ON tool_uses BEGIN
+    INSERT INTO tool_uses_fts(tool_uses_fts, rowid, tool_name, tool_input, tool_response)
+    VALUES('delete', old.id, old.tool_name, old.tool_input, old.tool_response);
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS tool_uses_au
+  AFTER UPDATE OF tool_name, tool_input, tool_response ON tool_uses BEGIN
+    INSERT INTO tool_uses_fts(tool_uses_fts, rowid, tool_name, tool_input, tool_response)
+    VALUES('delete', old.id, old.tool_name, old.tool_input, old.tool_response);
+    INSERT INTO tool_uses_fts(rowid, tool_name, tool_input, tool_response)
+    VALUES (new.id, new.tool_name, new.tool_input, new.tool_response);
+  END;
+`;
+
+/** One hit from the raw tool I/O tier: identity plus a short snippet, never the full payload. */
+export interface ToolUseSearchHit {
+  id: number;
+  tool_use_id: string;
+  tool_name: string;
+  project: string;
+  observation_id: number | null;
+  created_at: string;
+  created_at_epoch: number;
+  snippet: string;
+}
+
 type AnyTermFtsTable = 'observations_fts' | 'session_summaries_fts';
 
 /** Rows of an FTS table holding a word, and the table's row count, for one any-term query. */
@@ -135,6 +175,9 @@ export class SessionSearch {
     const tables = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%_fts'").all() as TableNameRow[];
     const hasObservationsFTS = tables.some(t => t.name === 'observations_fts');
     const hasSummariesFTS = tables.some(t => t.name === 'session_summaries_fts');
+    // The raw tool I/O index only applies once the tool_uses table exists (v51).
+    const needsToolUsesFTS = this.hasToolUsesTable()
+      && (!tables.some(t => t.name === 'tool_uses_fts') || !this.hasAllFtsTriggers(TOOL_USES_FTS_TRIGGER_NAMES));
 
     // #3609 — the tables alone are not proof of a working index: a DROP TABLE
     // rebuild (v7/v9) drops the sync triggers with the table while the index
@@ -144,7 +187,8 @@ export class SessionSearch {
       hasObservationsFTS &&
       hasSummariesFTS &&
       this.hasAllFtsTriggers(OBSERVATIONS_FTS_TRIGGER_NAMES) &&
-      this.hasAllFtsTriggers(SESSION_SUMMARIES_FTS_TRIGGER_NAMES)
+      this.hasAllFtsTriggers(SESSION_SUMMARIES_FTS_TRIGGER_NAMES) &&
+      !needsToolUsesFTS
     ) {
       return;
     }
@@ -188,6 +232,14 @@ export class SessionSearch {
           this.rebuildFtsIndex('session_summaries_fts');
           this.db.run(SESSION_SUMMARIES_FTS_TRIGGERS_SQL);
         }
+        if (this.hasToolUsesTable()) {
+          if (!currentTables.some(t => t.name === 'tool_uses_fts')) {
+            this.createToolUsesFts();
+          } else if (!this.hasAllFtsTriggers(TOOL_USES_FTS_TRIGGER_NAMES)) {
+            this.rebuildFtsIndex('tool_uses_fts');
+            this.db.run(TOOL_USES_FTS_TRIGGERS_SQL);
+          }
+        }
       }).immediate();
       logger.info('DB', repairingTriggersOnly ? 'FTS5 indexes converged and sync triggers recreated' : 'FTS5 tables created successfully');
     } catch (error) {
@@ -220,7 +272,7 @@ export class SessionSearch {
    * converges to itself. One-time cost — the repair only runs while triggers
    * are missing.
    */
-  private rebuildFtsIndex(ftsTable: 'observations_fts' | 'session_summaries_fts'): void {
+  private rebuildFtsIndex(ftsTable: 'observations_fts' | 'session_summaries_fts' | 'tool_uses_fts'): void {
     this.db.run(`INSERT INTO ${ftsTable}(${ftsTable}) VALUES('rebuild')`);
   }
 
@@ -236,7 +288,7 @@ export class SessionSearch {
   }
 
   /** An existing index can still be read when the writable probe is denied. */
-  private canReadFtsIndex(table: 'observations_fts' | 'session_summaries_fts'): boolean {
+  private canReadFtsIndex(table: 'observations_fts' | 'session_summaries_fts' | 'tool_uses_fts'): boolean {
     try {
       // Preparing this read loads the virtual table and checks MATCH support
       // without creating tables, changing the connection or scanning rows.
@@ -245,6 +297,32 @@ export class SessionSearch {
     } catch {
       return false;
     }
+  }
+
+  private hasToolUsesTable(): boolean {
+    return !!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tool_uses'").get();
+  }
+
+  /**
+   * Create and backfill the raw tool I/O index (#4060). Payloads are already clipped to
+   * MAX_TOOL_PAYLOAD_BYTES at write time, so the one-time backfill is bounded by that cap
+   * times the table's row count.
+   */
+  private createToolUsesFts(): void {
+    this.db.run(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS tool_uses_fts USING fts5(
+        tool_name,
+        tool_input,
+        tool_response,
+        content='tool_uses',
+        content_rowid='id'
+      );
+    `);
+    this.db.run(`
+      INSERT INTO tool_uses_fts(rowid, tool_name, tool_input, tool_response)
+      SELECT id, tool_name, tool_input, tool_response FROM tool_uses;
+    `);
+    this.db.run(TOOL_USES_FTS_TRIGGERS_SQL);
   }
 
   private createFTSTablesAndTriggers(createObservations: boolean, createSummaries: boolean): void {
@@ -1135,6 +1213,97 @@ export class SessionSearch {
     params.push(limit, offset);
 
     return this.db.prepare(sql).all(...params) as ObservationSearchResult[];
+  }
+
+  /** Rows the raw tool I/O tier returns at most, whatever the caller asks for. */
+  static readonly MAX_TOOL_USE_HITS = 20;
+
+  /**
+   * The deeper search tier over raw tool input/output (#4060). Callers query it only when
+   * observation-level search came up empty: a hit points at a tool call by id so the agent
+   * can fetch it with get_tool_uses, and carries a short snippet rather than the payload.
+   *
+   * Matching follows the observation tier's tokenizer answer (plan-25 / #3982) instead of
+   * forking a second one: queries in scripts unicode61 cannot segment, and stores without a
+   * readable index, are matched by substring; everything else is an FTS5 AND of the query's
+   * terms. There is no any-term widening here: raw tool output is noisy enough that an OR
+   * of common words would match nearly every row.
+   *
+   * Scope honours project (every read key), platform source and date range. Returns [] when
+   * the tool_uses table is absent or the query is empty.
+   */
+  searchToolUses(query: string | undefined, options: SearchOptions = {}): ToolUseSearchHit[] {
+    if (!query || !query.trim() || !this.hasToolUsesTable()) return [];
+    const limit = Math.min(Math.max(Math.floor(Number(options.limit) || 10), 1), SessionSearch.MAX_TOOL_USE_HITS);
+
+    const conditions: string[] = [];
+    const filterParams: Array<string | number> = [];
+    const projects = scopedProjects(options);
+    if (projects.length > 0) {
+      conditions.push(`t.project COLLATE NOCASE IN (${projects.map(() => '?').join(', ')})`);
+      filterParams.push(...projects);
+    }
+    if (options.platformSource) {
+      conditions.push(`COALESCE(NULLIF(t.platform_source, ''), '${DEFAULT_PLATFORM_SOURCE}') = ?`);
+      filterParams.push(normalizePlatformSource(options.platformSource));
+    }
+    if (options.dateRange?.start) {
+      conditions.push('t.created_at_epoch >= ?');
+      filterParams.push(resolveDateBound(options.dateRange.start, 'start'));
+    }
+    if (options.dateRange?.end) {
+      conditions.push('t.created_at_epoch <= ?');
+      filterParams.push(resolveDateBound(options.dateRange.end, 'end'));
+    }
+    const filterSql = conditions.map(condition => `AND ${condition}`).join(' ');
+    const columns = `t.id, t.tool_use_id, t.tool_name, t.project, t.observation_id, t.created_at, t.created_at_epoch`;
+
+    const useFts = !SessionSearch.UNSEGMENTED_SCRIPT.test(query)
+      && (this._fts5Available || this.canReadFtsIndex('tool_uses_fts'))
+      && !!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tool_uses_fts'").get();
+
+    if (useFts) {
+      const sql = `
+        SELECT ${columns},
+          snippet(tool_uses_fts, -1, '[', ']', '…', 16) AS snippet
+        FROM tool_uses_fts
+        JOIN tool_uses t ON t.id = tool_uses_fts.rowid
+        WHERE tool_uses_fts MATCH ?
+        ${filterSql}
+        ORDER BY tool_uses_fts.rank ASC
+        LIMIT ?
+      `;
+      return this.db.prepare(sql).all(SessionSearch.buildFTSMatchQuery(query), ...filterParams, limit) as ToolUseSearchHit[];
+    }
+
+    const match = SessionSearch.buildSubstringClause(query, ['t.tool_name', 't.tool_input', 't.tool_response']);
+    const sql = `
+      SELECT ${columns},
+        COALESCE(t.tool_input, '') AS input_text,
+        COALESCE(t.tool_response, '') AS response_text
+      FROM tool_uses t
+      WHERE ${match.clause}
+      ${filterSql}
+      ORDER BY t.created_at_epoch DESC, t.id DESC
+      LIMIT ?
+    `;
+    const rows = this.db.prepare(sql).all(...match.params, ...filterParams, limit) as Array<
+      Omit<ToolUseSearchHit, 'snippet'> & { input_text: string; response_text: string }
+    >;
+    const firstTerm = (query.match(SessionSearch.UNSEGMENTED_RUN) ?? [query])[0];
+    return rows.map(({ input_text, response_text, ...row }) => ({
+      ...row,
+      snippet: SessionSearch.substringSnippet(`${input_text}\n${response_text}`, firstTerm),
+    }));
+  }
+
+  /** A short window around the first occurrence of `term`, marked the way FTS5 snippet() marks it. */
+  private static substringSnippet(text: string, term: string, radius: number = 60): string {
+    const index = text.toLowerCase().indexOf(term.toLowerCase());
+    if (index < 0) return text.slice(0, radius * 2) + (text.length > radius * 2 ? '…' : '');
+    const start = Math.max(0, index - radius);
+    const end = Math.min(text.length, index + term.length + radius);
+    return `${start > 0 ? '…' : ''}${text.slice(start, index)}[${text.slice(index, index + term.length)}]${text.slice(index + term.length, end)}${end < text.length ? '…' : ''}`;
   }
 
   searchUserPrompts(query: string | undefined, options: SearchOptions = {}): UserPromptSearchResult[] {

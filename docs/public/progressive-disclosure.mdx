@@ -438,6 +438,17 @@ Payloads larger than 64 KB are truncated on write and carry a
 `…[truncated: N bytes]` marker, so a clipped body is distinguishable from one
 that legitimately ends where it does.
 
+### When search finds nothing in memory
+
+If a `search` query matches no observation, summary or prompt, claude-mem
+checks the raw tool input/output index before answering "no results". Matches
+come back as a short table of tool-use ids, tool names and one-line snippets,
+followed by the `get_tool_uses(ids=[...])` call to fetch the ones you need. The
+payloads themselves are never inlined. This tier is never consulted when memory
+search already has an answer, and it respects the same project, platform and
+date filters. JSON callers get the hits under `toolUses`; they do not count
+toward `totalResults`.
+
 ---
 
 ## Cognitive Load Theory
